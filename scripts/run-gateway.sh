@@ -40,6 +40,20 @@ say()  { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 note() { say "NOTE $*";  echo "::notice::$*"; }
 warn() { say "WARN $*";  echo "::warning::$*"; }
 
+try_vpngate_switch() {
+  if [ -f "/tmp/verified_nodes.json" ]; then
+    say "VPNGate: 检测到 429，尝试热切换到下一个已验证 200 节点..."
+    python3 scripts/switch_vpngate_node.py || true
+    sleep 2
+    local new_ip
+    new_ip="$(curl -s --max-time 6 -x http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null || echo '?')"
+    say "VPNGate: 切换完毕，当前出口 IP=$new_ip"
+    printf '%s\n' "$new_ip" > "$RUN/egress-ip.txt"
+    return 0
+  fi
+  return 1
+}
+
 curr_ip="$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || echo '?')"
 printf '%s\n' "$curr_ip" > "$RUN/egress-ip.txt"
 say "VPNGate 当前出口 IP=$curr_ip"
@@ -242,11 +256,14 @@ while [ "$attempt" -lt "$BOOT_TRIES" ]; do
   case "$v" in
     ok) boot_ok=1; break ;;
     limit)
-      if [ "$attempt" -ge "$BOOT_TRIES" ]; then
+      if [ "$attempt" -lt "$BOOT_TRIES" ]; then
+        warn "VPNGate 出口命中 429，尝试热切换下一个已验证节点 (第 $attempt/$BOOT_TRIES 次)..."
+        try_vpngate_switch || true
+        sleep 2
+      else
         dump_boot_diag
-        rotate "起手本地探测 429（试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
+        rotate "起手本地探测 429（换节点试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
       fi
-      if [ "$attempt" -lt "$BOOT_TRIES" ]; then sleep 3; fi
       ;;
     *)
       if [ "$attempt" -ge "$BOOT_TRIES" ]; then
@@ -291,7 +308,15 @@ while :; do
   sleep 15
 
   if [ -s "$REASON" ]; then
-    rotate "日志命中 429：$(head -c 200 "$REASON")" fast
+    say "捕获到日志 429，尝试 VPNGate 热切换下一个节点自愈..."
+    : > "$REASON"
+    try_vpngate_switch || true
+    probe_once "$BOOT_BASE" 30
+    if [ "$(verdict)" != "ok" ]; then
+      rotate "日志命中 429 且换节点后仍失败" fast
+    else
+      say "VPNGate 换节点成功自愈！"
+    fi
   fi
 
   if [ "$SECONDS" -ge "$MAX_RUN" ]; then
@@ -321,13 +346,21 @@ while :; do
       ok)
         ok_count=$((ok_count + 1))
         fail_count=0
+        limit_count=0
         ;;
       limit)
         limit_count=$((limit_count + 1))
-        if [ "$limit_count" -ge 2 ]; then
-          rotate "连续 $limit_count 次周期探测 429：${PROBE_BODY:0:200}" fast
+        warn "周期探测 429，自动切换下一个 VPNGate 节点自愈..."
+        try_vpngate_switch || true
+        probe_once
+        if [ "$(verdict)" = "ok" ]; then
+          say "VPNGate 换节点成功自愈！"
+          ok_count=$((ok_count + 1))
+          fail_count=0
+          limit_count=0
+        elif [ "$limit_count" -ge 2 ]; then
+          rotate "连续 $limit_count 次周期探测 429" fast
         fi
-        warn "周期探测 429（连续 $limit_count/2），先不下线，等下一轮"
         ;;
       *)
         fail_count=$((fail_count + 1))

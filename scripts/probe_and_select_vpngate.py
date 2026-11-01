@@ -255,8 +255,14 @@ def main() -> int:
     # 阶段三：生成最终出口配置
     # ==========================================
     if verified_nodes:
+        # 保存所有通过 200 验证的节点列表，供后续遭遇 429 时热切换自愈
+        Path("/tmp/verified_nodes.json").write_text(
+            json.dumps(verified_nodes, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        Path("/tmp/vpngate_current_idx.txt").write_text("0")
+
         chosen = verified_nodes[: args.keep_nodes]
-        print(f"[VPNGate] 选用排名前 {len(chosen)} 的 200 节点组建最终代理池：", flush=True)
+        print(f"[VPNGate] 选用排名前 {len(chosen)} 的 200 节点组建最终代理池（共保存 {len(verified_nodes)} 个备选）：", flush=True)
         final_endpoints = []
         for i, node in enumerate(chosen):
             ep = dict(node["endpoint"])
