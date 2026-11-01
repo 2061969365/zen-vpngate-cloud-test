@@ -60,7 +60,30 @@ def test_candidate_node(
         if not wait_port(port, proc, time.time() + 15):
             return None
 
-        # 通过该 sing-box 端口用 bin/zen-direct 发送真实上游探测
+        # 轮询等待隧道建立（通过该端口能出网，最多 20 秒）
+        tunnel_ok = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "4",
+                     "-x", f"http://127.0.0.1:{port}", "https://api.ipify.org"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if (r.stdout or "").strip() == "200":
+                    tunnel_ok = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1.2)
+
+        if not tunnel_ok:
+            print(f"[TUNNEL_FAIL] 节点 #{idx:02d} {host}:{srv_port} 隧道未能在 20s 内出网", flush=True)
+            return None
+
+        # 隧道已通！通过该 sing-box 端口用 bin/zen-direct 发送真实上游探测
         env = dict(
             os.environ,
             HTTPS_PROXY=f"http://127.0.0.1:{port}",
@@ -70,13 +93,13 @@ def test_candidate_node(
             ZEN_PROBE_BODY=probe_body,
         )
 
-        cp = subprocess.run([zen_bin], env=env, capture_output=True, text=True, timeout=25)
+        cp = subprocess.run([zen_bin], env=env, capture_output=True, text=True, timeout=30)
         out = (cp.stdout or "") + (cp.stderr or "")
         elapsed_ms = int((time.time() - start_t) * 1000)
 
         # 检查是否真正返回 200
         if cp.returncode == 0 or "-> 200" in out:
-            print(f"[VERIFIED 200] 节点 #{idx:02d} {host}:{srv_port} ({country_short}) 探测成功: {elapsed_ms}ms", flush=True)
+            print(f"[VERIFIED 200] 节点 #{idx:02d} {host}:{srv_port} ({country_short}) zen-direct 探测成功: {elapsed_ms}ms", flush=True)
             return {
                 "endpoint": ep_copy,
                 "server": host,
@@ -87,7 +110,7 @@ def test_candidate_node(
             }
         else:
             first_line = out.strip().split("\n")[0] if out.strip() else f"rc={cp.returncode}"
-            print(f"[REJECTED] 节点 #{idx:02d} {host}:{srv_port} 未过 200: {first_line[:90]}", flush=True)
+            print(f"[REJECTED] 节点 #{idx:02d} {host}:{srv_port} zen-direct 未过 200: {first_line[:120]}", flush=True)
             return None
     except subprocess.TimeoutExpired:
         print(f"[TIMEOUT] 节点 #{idx:02d} {host}:{srv_port} zen-direct 探测超时 (25s)", flush=True)

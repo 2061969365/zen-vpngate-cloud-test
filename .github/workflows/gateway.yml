@@ -75,7 +75,7 @@ jobs:
           sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version | head -1
 
-          echo "拉取 VPNGate 节点并用 bin/zen-direct 20 并发实测探测 200..."
+          echo "拉取 VPNGate 节点，20 并发探死活 + 20 并发用 bin/zen-direct 真实发消息探测 200..."
           curl -s -m 60 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
           python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 30 --keep-nodes 3 --mixed-port 18080 || true
 
