@@ -282,21 +282,6 @@ if [ -n "$PUBLIC_URL" ]; then
   fi
 fi
 note "IP 与出口验证完毕，开始服务"
-  t=0
-  while [ "$t" -lt "$BOOT_TRIES" ]; do
-    t=$((t + 1))
-    code="$(http_code "$PUBLIC_URL/health" 10)"
-    say "tunnel check #$t/$BOOT_TRIES -> $code"
-    if [ "$code" = "200" ]; then tunnel_ok=1; break; fi
-    sleep 3
-  done
-  if [ "$tunnel_ok" = "1" ]; then
-    note "隧道已通：$PUBLIC_URL"
-  else
-    warn "公网 /health 没回到 200（最后一次 $code），隧道可能不稳；继续以本地为准服务"
-  fi
-fi
-note "IP 可用，开始服务"
 
 next_probe=$((SECONDS + PROBE_INTERVAL))
 gw_restarts=0
