@@ -138,8 +138,8 @@ def main() -> int:
     parser.add_argument("--probe-body", default="scripts/probe_body.json", help="Path to probe_body.json")
     parser.add_argument("--singbox-bin", default="sing-box", help="Path to sing-box binary")
     parser.add_argument("--concurrency", type=int, default=35, help="Concurrency for probes (default 35)")
-    parser.add_argument("--max-candidates", type=int, default=35, help="Max candidates for phase 2 (default 35)")
-    parser.add_argument("--keep-nodes", type=int, default=2, help="Number of verified 200 nodes to keep (default 2)")
+    parser.add_argument("--max-candidates", type=int, default=50, help="Max candidates for phase 2 (default 50)")
+    parser.add_argument("--keep-nodes", type=int, default=3, help="Number of verified 200 nodes to keep (default 3)")
     parser.add_argument("--mixed-port", type=int, default=18080, help="Production mixed inbound port (default 18080)")
     args = parser.parse_args()
 
@@ -169,9 +169,17 @@ def main() -> int:
             if res is not None:
                 alive_candidates.append(res)
 
-    alive_candidates.sort(key=lambda x: x[0])  # 按 TCP 握手延迟升序排序
+    def rank_key(cand):
+        ep = cand[4]
+        host, _ = v2s.primary_server(ep)
+        # 筑波大学公共总机房段（219.100.37.x 等）常年被数千人刷满 429
+        # 将干净的独立住宅/商业志愿节点排在最前，公共滥用段放最后，极大提升 200 命中率！
+        is_abused = host.startswith("219.100.37.") or host.startswith("150.40.105.")
+        return (1 if is_abused else 0, cand[0])
+
+    alive_candidates.sort(key=rank_key)
     elapsed_p1 = int((time.time() - t0) * 1000)
-    print(f"[阶段一完成] 耗时 {elapsed_p1}ms：筛选出 {len(alive_candidates)} 个存活节点！", flush=True)
+    print(f"[阶段一完成] 耗时 {elapsed_p1}ms：筛选出 {len(alive_candidates)} 个存活节点（已优先前置独立住宅出口）！", flush=True)
 
     if not alive_candidates:
         print("[VPNGate] 错误：没有找到任何存活节点！", file=sys.stderr)
