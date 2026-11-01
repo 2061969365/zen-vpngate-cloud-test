@@ -83,12 +83,12 @@ jobs:
           sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version | head -1
 
-      - name: Setup sing-box & VPNGate (极速 40 探活 + 30 并发 zen-direct 真实发包 + 早停)
+      - name: Setup sing-box & VPNGate (极速 50 探活 + 35 并发单探针 200 + 极速早停)
         run: |
           set -euo pipefail
-          echo "拉取 VPNGate 节点，40 并发探死活 + 30 并发用 bin/zen-direct 真实发消息探测 200..."
-          curl -s -m 30 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
-          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 30 --max-candidates 35 --keep-nodes 2 --mixed-port 18080 || true
+          echo "拉取 VPNGate 节点 (开启 gzip 极速传输)..."
+          curl -s --compressed -m 20 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 35 --max-candidates 35 --keep-nodes 2 --mixed-port 18080 || true
 
           if [ -s /tmp/sb.json ]; then
             sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
