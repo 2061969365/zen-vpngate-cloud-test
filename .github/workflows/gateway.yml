@@ -75,9 +75,9 @@ jobs:
           sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version | head -1
 
-          echo "拉取 VPNGate 节点并生成 sing-box 配置"
+          echo "拉取 VPNGate 节点并用 bin/zen-direct 20 并发实测探测 200..."
           curl -s -m 60 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
-          python3 scripts/vpngate_to_singbox.py --csv /tmp/vg.csv --output /tmp/sb.json --limit 10 --tag vpn --mixed 127.0.0.1:18080 --real-topk 3 || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 30 --keep-nodes 3 --mixed-port 18080 || true
 
           if [ -s /tmp/sb.json ]; then
             sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
@@ -85,7 +85,7 @@ jobs:
             echo "sing-box 启动完成，监听 127.0.0.1:18080"
             touch /tmp/vpngate_ready
           else
-            echo "VPNGate 快照解析为空，使用原生网络兜底"
+            echo "未筛选出可用节点，使用原生网络兜底"
           fi
 
       - name: Install cloudflared

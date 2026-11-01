@@ -1,3 +1,5 @@
 run/
 bin/cloudflared
 *.log
+__pycache__/
+*.pyc

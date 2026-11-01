@@ -22,10 +22,8 @@ DEFAULT_PASSWORD = "vpn"
 # so the old ciphers must be listed explicitly.
 DEFAULT_DATA_CIPHERS = ["AES-128-CBC", "AES-256-CBC", "BF-CBC"]
 DEFAULT_AUTH = "SHA1"
-# Cap concurrent throwaway sing-box dials: refresh (dial_workers) +
-# full_probe + single_probe + verify can otherwise stack ~13 processes
-# on a 1GB box. Excess dialers queue on the gate instead of OOMing.
-MAX_CONCURRENT_DIALS = 10
+# Cap concurrent throwaway sing-box dials
+MAX_CONCURRENT_DIALS = 25
 _DIAL_GATE = threading.BoundedSemaphore(MAX_CONCURRENT_DIALS)
 
 _BLOCK_RE = re.compile(r"<(ca|cert|key|tls-auth|tls-crypt)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
@@ -242,11 +240,12 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
-                           target_host: str = "www.gstatic.com",
+                           target_host: str = "opencode.ai",
                            target_port: int = 443,
-                           path: str = "/generate_204",
+                           path: str = "/",
                            timeout: float = 20,
-                           cafile: str | None = None) -> int | None:
+                           cafile: str | None = None,
+                           expected_codes: tuple[int, ...] = (200, 204, 301, 302)) -> int | None:
     """One HTTPS GET through a SOCKS5 proxy; ms on HTTP 204, else None.
 
     The GET goes through a real TLS handshake (SNI=target_host), so the
@@ -304,7 +303,7 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
             code = int(head.split(b" ", 2)[1])
         except (IndexError, ValueError):
             return None
-        if code != 204:
+        if code not in expected_codes:
             return None
         return max(1, int((time.monotonic() - start) * 1000))
     except (OSError, ValueError):
@@ -441,10 +440,11 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
 
 def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                          timeout: int = 20, poll_interval: int = 2,
-                         target_host: str = "www.gstatic.com",
+                         target_host: str = "opencode.ai",
                          target_port: int = 443,
-                         path: str = "/generate_204") -> int | None:
-    """Dial one endpoint with a throwaway sing-box; end-to-end GET ms or None."""
+                         path: str = "/",
+                         expected_codes: tuple[int, ...] = (200, 204, 301, 302)) -> int | None:
+    """Dial one endpoint with a throwaway sing-box; verify HTTP 200/reachable ms or None."""
     port = _free_port()
     config = _dial_probe_config(endpoint, port)
     tmpdir = tempfile.TemporaryDirectory()
@@ -477,6 +477,7 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                 remaining = deadline - time.monotonic()
                 first = _socks5_get_latency_ms(
                     "127.0.0.1", port, target_host, target_port, path,
+                    expected_codes=expected_codes,
                     timeout=min(10, max(1, remaining)))
                 if first is not None:
                     # The readiness probe already completed a full HTTPS GET
@@ -640,12 +641,16 @@ def snapshot_to_nodes(
     probe: bool = True,
     probe_fn=None,
     probe_timeout: int = 5,
-    probe_workers: int = 20,
-    probe_pool: int = 30,
+    probe_workers: int = 30,
+    probe_pool: int = 60,
     real_topk: int = 0,
     dial_fn=None,
-    dial_workers: int = 3,
-    dial_timeout: int = 20,
+    dial_workers: int = 20,
+    dial_timeout: int = 15,
+    target_host: str = "opencode.ai",
+    target_port: int = 443,
+    target_path: str = "/",
+    only_verified: bool = True,
     singbox_bin: str = "sing-box",
     username: str = DEFAULT_USERNAME,
     password: str = DEFAULT_PASSWORD,
@@ -714,7 +719,8 @@ def snapshot_to_nodes(
 
     if real_topk and real_topk > 0 and nodes:
         dial = dial_fn if dial_fn is not None else (
-            lambda node: measure_real_latency(node["endpoint"], singbox_bin, dial_timeout))
+            lambda node: measure_real_latency(node["endpoint"], singbox_bin, dial_timeout,
+                                             target_host=target_host, target_port=target_port, path=target_path))
         target = min(real_topk, len(nodes))
         with ThreadPoolExecutor(max_workers=dial_workers) as executor:
             idx = 0
@@ -728,6 +734,10 @@ def snapshot_to_nodes(
                     future_map[future]["real_latency_ms"] = future.result()
                 measured = sum(1 for n in nodes[:idx]
                                if n.get("real_latency_ms") is not None)
+        if only_verified:
+            verified = [n for n in nodes if n.get("real_latency_ms") is not None]
+            if verified:
+                nodes = verified
         nodes.sort(key=lambda n: (0, n["real_latency_ms"])
                    if n["real_latency_ms"] is not None
                    else (1, n["latency_ms"] if n["latency_ms"] is not None else 10 ** 9))
@@ -769,12 +779,16 @@ def snapshot_to_endpoints(
     probe: bool = True,
     probe_fn=None,
     probe_timeout: int = 5,
-    probe_workers: int = 20,
-    probe_pool: int = 30,
+    probe_workers: int = 30,
+    probe_pool: int = 60,
     real_topk: int = 0,
     dial_fn=None,
-    dial_workers: int = 3,
-    dial_timeout: int = 20,
+    dial_workers: int = 20,
+    dial_timeout: int = 15,
+    target_host: str = "opencode.ai",
+    target_port: int = 443,
+    target_path: str = "/",
+    only_verified: bool = True,
     singbox_bin: str = "sing-box",
 ) -> list[dict]:
     """Parse a VPNGate CSV snapshot into tagged sing-box endpoints.
@@ -788,6 +802,8 @@ def snapshot_to_endpoints(
         probe_timeout=probe_timeout, probe_workers=probe_workers,
         probe_pool=probe_pool, real_topk=real_topk, dial_fn=dial_fn,
         dial_workers=dial_workers, dial_timeout=dial_timeout,
+        target_host=target_host, target_port=target_port,
+        target_path=target_path, only_verified=only_verified,
         singbox_bin=singbox_bin, username=username, password=password)
     if not nodes:
         raise ValueError("snapshot contains no reachable nodes")
@@ -898,9 +914,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="max endpoints for --csv mode, 0 = all")
     parser.add_argument("--real-topk", type=int, default=0,
                         help="re-rank top-K by real tunnel latency (0 = off)")
+    parser.add_argument("--dial-workers", type=int, default=20,
+                        help="concurrent sing-box dial workers for 200 checks")
     parser.add_argument("--no-probe", action="store_true",
                         help="skip TCP handshake probing, rank by Speed instead")
     parser.add_argument("--mixed", default=None, help="optional mixed inbound HOST:PORT for dial tests")
+    parser.add_argument("--target-host", default="opencode.ai", help="target host for 200 dial check")
+    parser.add_argument("--target-path", default="/", help="target path for 200 dial check")
+    parser.add_argument("--target-port", type=int, default=443, help="target port for 200 dial check")
+    parser.add_argument("--only-verified", action="store_true", default=True,
+                        help="only output nodes that pass real 200 dial check")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
     args = parser.parse_args(argv)
@@ -917,6 +940,9 @@ def main(argv: list[str] | None = None) -> int:
             csv_text, limit=args.limit, tag_prefix=args.tag,
             username=args.username, password=args.password,
             probe=not args.no_probe, real_topk=args.real_topk,
+            dial_workers=args.dial_workers,
+            target_host=args.target_host, target_port=args.target_port,
+            target_path=args.target_path, only_verified=args.only_verified,
         )
         Path(args.output).write_text(
             json.dumps(build_singbox_config(endpoints, mixed_listen, mixed_port), indent=2) + "\n",

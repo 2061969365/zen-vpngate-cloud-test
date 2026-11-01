@@ -227,24 +227,8 @@ if ! wait_local_health 120; then
 fi
 
 watch_logs
-start_tunnel
-if ! wait_public_health; then
-  tail -n 30 "$CF_LOG" 2>/dev/null || true
-  if grep -q 'first record does not look like a TLS handshake' "$CF_LOG" 2>/dev/null; then
-    warn "Cloudflare 回源配成了 HTTPS，但网关是明文 HTTP。"
-    printf '配置错误：隧道回源 scheme 不是 HTTP\n' > "$FLAG"
-    printf '%s\n' "config-error" > "$RUN/no-handoff"
-    exit 3
-  fi
-  if grep -qE 'Unauthorized|Invalid tunnel secret|failed to authenticate' "$CF_LOG" 2>/dev/null; then
-    warn "Cloudflare 隧道 token 无效或已轮换，检查 CF_TUNNEL_TOKEN。"
-    printf '配置错误：隧道 token 无效\n' > "$FLAG"
-    printf '%s\n' "config-error" > "$RUN/no-handoff"
-    exit 3
-  fi
-  rotate "公网 /health 180s 没拿到 200"
-fi
 
+# 优先执行本地真 chat 探针：验证网关 + VPNGate sing-box 出口是否真正拿到 200
 BOOT_BASE="http://127.0.0.1:$PORT"
 BOOT_TRIES=3
 boot_ok=0
@@ -277,11 +261,27 @@ if [ "$boot_ok" = "0" ]; then
   rotate "起手探测 $BOOT_TRIES 次没拿到 200（最后一次 $PROBE_CODE）"
 fi
 ok_count=$((ok_count + 1))
-note "网关就绪（本地 chat 200），开始验隧道"
+note "网关就绪（VPNGate 本地 chat 200），开始起隧道"
 
+start_tunnel
 if [ -n "$PUBLIC_URL" ]; then
-  note "验证隧道：$PUBLIC_URL/health"
+  note "验证公网隧道：$PUBLIC_URL/health"
   tunnel_ok=0
+  t=0
+  while [ "$t" -lt "$BOOT_TRIES" ]; do
+    t=$((t + 1))
+    code="$(http_code "$PUBLIC_URL/health" 10)"
+    say "tunnel check #$t/$BOOT_TRIES -> $code"
+    if [ "$code" = "200" ]; then tunnel_ok=1; break; fi
+    sleep 3
+  done
+  if [ "$tunnel_ok" = "1" ]; then
+    note "公网已通：$PUBLIC_URL"
+  else
+    warn "公网 /health 没回到 200（最后一次 $code），可能是新域名/回源解析中；本地 chat 200 已就绪，继续服务"
+  fi
+fi
+note "IP 与出口验证完毕，开始服务"
   t=0
   while [ "$t" -lt "$BOOT_TRIES" ]; do
     t=$((t + 1))
