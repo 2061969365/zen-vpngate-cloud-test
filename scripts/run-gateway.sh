@@ -139,7 +139,6 @@ start_gateway() {
   DIRECT_FRESH_PER_TURN="${DIRECT_FRESH_PER_TURN:-0}" \
   ZEN_TLS=bun \
   ZEN_RUN_ID="${GITHUB_RUN_ID:-}" \
-  ZEN_NO_STUB="${ZEN_NO_STUB:-}" \
   DIRECT_SIDECAR=off \
   "$BIN/zen-direct" >>"$GW_STDIO" 2>&1 &
   GW_PID=$!
