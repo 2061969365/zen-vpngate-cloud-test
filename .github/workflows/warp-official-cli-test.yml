@@ -1,0 +1,291 @@
+name: warp-official-cli-test
+
+# 手动测试：在 WARP 双栈出口上用官方 OpenCode CLI 对话指定模型。
+# WARP 安装方式与 template-warp 保持一致（cloudflare-warp deb + 双栈 DNS 修复）。
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "opencode 模型（provider/model）"
+        required: false
+        default: "opencode/crouton-alpha-free"
+      prompt:
+        description: "发给模型的提示词"
+        required: false
+        default: "Reply with the single word: ok"
+
+permissions:
+  contents: read
+
+jobs:
+  warp-cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODEL: ${{ inputs.model }}
+      PROMPT: ${{ inputs.prompt }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pre-WARP egress
+        run: |
+          echo "RAW_IPV4=$(curl -s4 --max-time 10 https://api.ipify.org || echo '?')"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=' || true
+
+      - name: Cache cloudflare-warp package
+        id: cache-warp-deb
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cloudflare-warp.deb
+          key: cloudflare-warp-deb-v2026.8
+
+      - name: Setup WARP
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cache-warp-deb.outputs.cache-hit }}" != 'true' ] || [ ! -s /tmp/cloudflare-warp.deb ]; then
+            echo "下载 cloudflare-warp 独立包..."
+            curl -fsSL --retry 3 --retry-delay 1 \
+              -o /tmp/cloudflare-warp.deb \
+              https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          fi
+          sudo apt-get -o Acquire::Retries=3 update -y
+          if ! sudo dpkg -i /tmp/cloudflare-warp.deb; then
+            echo "cloudflare-warp 依赖未满足，安装缺失依赖..."
+            sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing
+            sudo dpkg -i /tmp/cloudflare-warp.deb
+          fi
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          ready=0
+          for i in $(seq 1 30); do
+            if sudo systemctl is-active --quiet warp-svc; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::cloudflare-warp daemon 未就绪"
+            sudo systemctl status warp-svc --no-pager || true
+            exit 1
+          fi
+          sleep 1
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode warp+doh
+          sudo warp-cli --accept-tos connect
+          sleep 2
+          sudo warp-cli --accept-tos status || true
+
+      - name: Fix DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 2606:4700:4700::1111' 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf
+          echo "WARP_IPV4=$(curl -s4 --max-time 10 https://api.ipify.org || echo '?')"
+          echo "WARP_IPV6=$(curl -s6 --max-time 10 https://api6.ipify.org || echo 'none')"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=|colo=' || true
+
+      - name: Install official CLI
+        run: |
+          set -euo pipefail
+          npm install -g @opencode/cli@2.2.5 >/tmp/npm.log 2>&1 || { echo "CLI_INSTALL_FAIL"; tail -20 /tmp/npm.log; exit 1; }
+          echo "CLI_VERSION=$(opencode --version 2>&1 | head -1)"
+
+      - name: Turn 1 through WARP
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set +e
+          out=$(timeout 180 opencode run -m "$MODEL" "$PROMPT" 2>&1)
+          rc=$?
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "T1 rc=$rc chars=${#clean}"
+          echo "T1_TAIL=$(printf '%s' "$clean" | tail -5 | tr '\n' '|' | head -c 500)"
+          printf '%s' "$clean" > /tmp/t1.txt
+          echo "T1_RC=$rc" >> "$GITHUB_ENV"
+
+      - name: Reconnect WARP and Turn 2
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set +e
+          sudo warp-cli --accept-tos disconnect || true
+          sleep 3
+          sudo warp-cli --accept-tos connect || true
+          sleep 3
+          echo "WARP_IPV4_2=$(curl -s4 --max-time 10 https://api.ipify.org || echo '?')"
+          echo "WARP_IPV6_2=$(curl -s6 --max-time 10 https://api6.ipify.org || echo 'none')"
+          out=$(timeout 180 opencode run -m "$MODEL" "$PROMPT" 2>&1)
+          rc=$?
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "T2 rc=$rc chars=${#clean}"
+          echo "T2_TAIL=$(printf '%s' "$clean" | tail -5 | tr '\n' '|' | head -c 500)"
+          printf '%s' "$clean" > /tmp/t2.txt
+          echo "T2_RC=$rc" >> "$GITHUB_ENV"
+
+      - name: Probe our binary gateway
+        run: |
+          set +e
+          chmod +x bin/zen-direct
+          mkdir -p run
+          GW_MODEL="${MODEL#opencode/}"
+          jq -n --arg m "$GW_MODEL" --arg p "$PROMPT" \
+            '{model:$m,messages:[{role:"user",content:$p}],max_tokens:64,stream:true}' > /tmp/gw_req.json
+
+          start_gw() {
+            PORT=18081 \
+            LOG_FILE="$PWD/run/gateway.log" \
+            SHIM_SESSION_FILE="$PWD/run/shim_sessions.json" \
+            DIRECT_DIAG=1 \
+            DIRECT_DEBUG=0 \
+            DIRECT_CONCURRENCY=4 \
+            DIRECT_FREELIMIT_COOLDOWN=0 \
+            DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun \
+            ZEN_RUN_ID="${GITHUB_RUN_ID:-}" \
+            DIRECT_SIDECAR=off \
+            bin/zen-direct >> run/gateway.stdio.log 2>&1 &
+            GW_PID=$!
+          }
+
+          stop_gw() {
+            if [ -n "${GW_PID:-}" ]; then
+              kill "$GW_PID" 2>/dev/null || true
+              wait "$GW_PID" 2>/dev/null || true
+            fi
+          }
+
+          wait_gw() {
+            for _ in $(seq 1 60); do
+              health=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:18081/health 2>/dev/null)
+              [ "$health" = "200" ] && return 0
+              kill -0 "$GW_PID" 2>/dev/null || return 1
+              sleep 2
+            done
+            return 1
+          }
+
+          probe_gw() {
+            GW_CODE=$(curl -sS -o /tmp/gw_body -w '%{http_code}' --max-time 180 \
+              -H 'Content-Type: application/json' \
+              -H 'Authorization: Bearer public' \
+              -H 'User-Agent: zen-probe' \
+              --data-binary @/tmp/gw_req.json \
+              http://127.0.0.1:18081/v1/chat/completions 2>/tmp/gw.err)
+            [ $? -ne 0 ] && GW_CODE=000
+            GW_BODY=$(head -c 500 /tmp/gw_body 2>/dev/null | tr '\n' ' ')
+            GW_TAIL=$(tail -c 300 /tmp/gw_body 2>/dev/null | tr '\n' ' ')
+            if grep -qi '"content":"ok"' /tmp/gw_body 2>/dev/null; then GW_TEXT_OK=1; else GW_TEXT_OK=0; fi
+          }
+
+          GW_TEXT_OK=0
+          GW_TAIL=""
+          start_gw
+          if ! wait_gw; then
+            echo "GW gateway not healthy"
+            tail -20 run/gateway.log 2>/dev/null || true
+            tail -20 run/gateway.stdio.log 2>/dev/null || true
+            GW_CODE=000
+            GW_BODY="gateway_not_healthy"
+          else
+            probe_gw
+            echo "GW attempt1 code=$GW_CODE content_ok=$GW_TEXT_OK body=$GW_BODY"
+            if [ "$GW_CODE" != "200" ] || [ "$GW_TEXT_OK" != "1" ]; then
+              echo "GW reconnect WARP and restart gateway..."
+              sudo warp-cli --accept-tos disconnect || true
+              sleep 3
+              sudo warp-cli --accept-tos connect || true
+              sleep 3
+              stop_gw
+              sleep 1
+              start_gw
+              if wait_gw; then
+                probe_gw
+                echo "GW attempt2 code=$GW_CODE content_ok=$GW_TEXT_OK body=$GW_BODY"
+              else
+                GW_CODE=000
+                GW_BODY="gateway_not_healthy_after_reconnect"
+                GW_TEXT_OK=0
+                GW_TAIL=""
+              fi
+            fi
+          fi
+          stop_gw
+          {
+            echo "GW_CODE=$GW_CODE"
+            echo "GW_BODY=$GW_BODY"
+            echo "GW_TAIL=$GW_TAIL"
+            echo "GW_TEXT_OK=$GW_TEXT_OK"
+          } > /tmp/gw_result
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os, sys
+
+          def rd(p):
+              try:
+                  return open(p, encoding='utf-8', errors='replace').read().strip()
+              except Exception:
+                  return ''
+
+          def verdict(t):
+              if not t:
+                  return 'NO_OUTPUT'
+              low = t.lower()
+              if 'free usage limit' in low or 'freeusagelimiterror' in low or '429' in t:
+                  return '429'
+              if 'model unavailable' in low or 'model not found' in low or 'not available' in low:
+                  return 'MODEL_BAD'
+              if 'econnrefused' in low:
+                  return 'ECONNREFUSED'
+              if 'econnreset' in low:
+                  return 'ECONNRESET'
+              if low.startswith('error:') or 'error:' in low[:120]:
+                  return 'ERROR'
+              if len(t) > 5:
+                  return 'OK'
+              return 'OTHER'
+
+          t1, t2 = rd('/tmp/t1.txt'), rd('/tmp/t2.txt')
+          v1, v2 = verdict(t1), verdict(t2)
+          model = os.environ.get('MODEL', '?')
+          shard = os.environ.get('SHARD', '?')
+
+          gw = {}
+          for line in rd('/tmp/gw_result').splitlines():
+              if '=' in line:
+                  k, v = line.split('=', 1)
+                  gw[k] = v
+          gcode, gbody = gw.get('GW_CODE', '?'), gw.get('GW_BODY', '')
+          gtail, gtext = gw.get('GW_TAIL', ''), gw.get('GW_TEXT_OK', '0')
+
+          def gw_verdict(code, body, text_ok):
+              low = body.lower()
+              if code == '200' and text_ok == '1':
+                  return 'OK'
+              if code == '200':
+                  return 'HTTP200_NO_TEXT'
+              if code == '429' or 'freeusagelimiterror' in low or 'free usage limit' in low:
+                  return '429'
+              if code == '000':
+                  return 'NO_GATEWAY'
+              if 'model' in low and ('unavailable' in low or 'not found' in low):
+                  return 'MODEL_BAD'
+              return 'HTTP_' + code
+
+          gv = gw_verdict(gcode, gbody, gtext)
+          print(f"### Shard {shard} - `{model}`")
+          print(f"- Turn1: **{v1}** rc={os.environ.get('T1_RC','?')} | `{t1[-200:].replace(chr(10), ' ')}`")
+          print(f"- Turn2 (WARP reconnect): **{v2}** rc={os.environ.get('T2_RC','?')} | `{t2[-200:].replace(chr(10), ' ')}`")
+          print(f"- Gateway zen-direct: **{gv}** http={gcode} content_ok={gtext} | `{gtail[-200:].replace('`', chr(39))}`")
+          print(f"RESULT shard={shard} model={model} v1={v1} v2={v2} gw={gv} gw_http={gcode} gw_content={gtext}", file=sys.stderr)
+          PY

@@ -1,0 +1,202 @@
+name: cli-capture
+
+# WARP 出口上的官方 CLI ↔ 网关 A/B 抓包。
+#
+# 目的：在**同一条 WARP 出口 IP** 上，让官方 CLI 与我们的网关分别发同一条请求，
+# 逐字段 diff 出站请求（头顺序、头值、body），定位 429 的真实触发点。
+#
+# 关键设计：两边都把 baseURL 指向本地 sink（明文 HTTP），先拿到双方"准备发什么"；
+# 再各自直连真实上游跑一次，拿到"上游怎么回"。全程不改 TLS 指纹。
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "模型 id（不带 provider 前缀）"
+        required: false
+        default: "deepseek-v4.1-flash-free"
+      prompt:
+        description: "提示词"
+        required: false
+        default: "read a.txt then tell me what it says"
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODEL: ${{ inputs.model }}
+      PROMPT: ${{ inputs.prompt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cloudflare-warp package
+        id: cache-warp-deb
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cloudflare-warp.deb
+          key: cloudflare-warp-deb-v2026.8
+
+      - name: Setup WARP
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cache-warp-deb.outputs.cache-hit }}" != 'true' ] || [ ! -s /tmp/cloudflare-warp.deb ]; then
+            curl -fsSL --retry 3 --retry-delay 1 \
+              -o /tmp/cloudflare-warp.deb \
+              https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          fi
+          sudo apt-get -o Acquire::Retries=3 update -y >/dev/null 2>&1 || true
+          if ! sudo dpkg -i /tmp/cloudflare-warp.deb >/dev/null 2>&1; then
+            sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing >/dev/null 2>&1 || true
+            sudo dpkg -i /tmp/cloudflare-warp.deb >/dev/null 2>&1 || true
+          fi
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do
+            timeout 2 sudo warp-cli --accept-tos status >/dev/null 2>&1 && break
+            sleep 1
+          done
+          sudo warp-cli --accept-tos registration new || true
+          sudo warp-cli --accept-tos mode warp+doh || true
+          sudo warp-cli --accept-tos connect || true
+          for i in $(seq 1 40); do
+            st="$(timeout 2 sudo warp-cli --accept-tos status 2>&1 || true)"
+            printf '%s' "$st" | grep -qE 'Status update: Connected|warp=on' && break
+            sleep 1
+          done
+          sudo rm -f /etc/resolv.conf
+          printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 2606:4700:4700::1111' 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf >/dev/null
+          echo "WARP_IPV4=$(curl -s4 --max-time 10 https://api.ipify.org || echo '?')"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+
+      - name: Install official CLI
+        run: |
+          set -euo pipefail
+          npm install -g @opencode/cli@2.2.5 >/tmp/npm.log 2>&1 || { tail -20 /tmp/npm.log; exit 1; }
+          echo "CLI_VERSION=$(opencode --version 2>&1 | head -1)"
+
+      - name: Start sink and capture official CLI outbound
+        run: |
+          set -euo pipefail
+          mkdir -p cap/proj
+          python3 -u scripts/sink.py --port 19100 --out "$PWD/cap/cli_out" > cap/sink.log 2>&1 &
+          sleep 2
+
+          # 官方 CLI 的 zen provider 指向本地 sink：只抓"它准备发什么"
+          mkdir -p "$HOME/.config/opencode"
+          cat > "$HOME/.config/opencode/opencode.json" <<EOF
+          {
+            "\$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "opencode": {
+                "options": {
+                  "apiKey": "public",
+                  "baseURL": "http://127.0.0.1:19100/zen/v1"
+                }
+              }
+            }
+          }
+          EOF
+
+          cd cap/proj
+          OPENCODE_DISABLE_AUTOUPDATE=1 NO_COLOR=1 \
+            timeout 180 opencode run -m "opencode/$MODEL" "$PROMPT" > ../cli_sink_run.log 2>&1 || true
+          cd ../..
+          echo "--- sink captured ---"
+          ls -l cap/cli_out || true
+
+      - name: Capture gateway outbound
+        run: |
+          set -euo pipefail
+          chmod +x bin/zen-direct || true
+          mkdir -p cap
+          PORT=18081 \
+          OPENCODE_ZEN_BASE="http://127.0.0.1:19100/zen/v1" \
+          DIRECT_SIDECAR=off \
+          DIRECT_FREELIMIT_COOLDOWN=0 \
+          DIRECT_UA_REFRESH=0 \
+          DIRECT_DIAG=1 \
+          bin/zen-direct > cap/gw_sink.log 2>&1 &
+          GW=$!
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:18081/health)" = "200" ] && break
+            sleep 1
+          done
+
+          # 把官方 CLI 刚抓到的那份 body 原样喂给网关
+          LAST=$(ls -1 cap/cli_out/*chat_completions*.json 2>/dev/null | sort | tail -1 || true)
+          if [ -z "$LAST" ]; then echo "::error::没有抓到 CLI 出站 body"; exit 1; fi
+          jq -r '.body' "$LAST" > cap/cli_body.json
+          echo "CLI body bytes: $(wc -c < cap/cli_body.json)"
+
+          curl -s -o cap/gw_replay_resp.txt -w '%{http_code}\n' --max-time 120 \
+            -X POST "http://127.0.0.1:18081/v1/chat/completions" \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer public' \
+            --data-binary @cap/cli_body.json > cap/gw_replay_code.txt || true
+          echo "gw replay (to sink) code: $(cat cap/gw_replay_code.txt)"
+
+          kill $GW 2>/dev/null || true
+          sleep 1
+          echo "--- sink files ---"
+          ls -l cap/cli_out
+
+      - name: A/B against real upstream
+        run: |
+          set +e
+          LAST=$(ls -1 cap/cli_out/*chat_completions*.json | sort | tail -1)
+          jq -r '.body' "$LAST" > cap/cli_body.json
+
+          # 网关整形后的出站 body（sink 里最新、且 tools 数量不同于 CLI 的那份）
+          GWLAST=$(ls -1 cap/cli_out/*chat_completions*.json | sort | tail -1)
+
+          code_cli=$(curl -s -o cap/up_cli.txt -w '%{http_code}' --max-time 120 \
+            -X POST "https://opencode.ai/zen/v1/chat/completions" \
+            -H "Authorization: Bearer public" -H "Content-Type: application/json" \
+            -H "User-Agent: opencode/latest/2.2.5/cli" \
+            -H "x-opencode-client: cli" \
+            -H "x-opencode-project: $(jq -r '(.headers[]|select(.[0]=="x-opencode-project"))[1]' "$LAST")" \
+            -H "x-opencode-session: $(jq -r '(.headers[]|select(.[0]=="x-opencode-session"))[1]' "$LAST")" \
+            -H "x-session-affinity: $(jq -r '(.headers[]|select(.[0]=="x-session-affinity"))[1]' "$LAST")" \
+            -H "x-session-id: $(jq -r '(.headers[]|select(.[0]=="x-opencode-session"))[1]' "$LAST")" \
+            --data-binary @cap/cli_body.json)
+          echo "UPSTREAM exact-cli-body => $code_cli"
+          head -c 400 cap/up_cli.txt; echo
+
+      - name: Upload captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-capture
+          path: cap/
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json, os
+          files = sorted(glob.glob('cap/cli_out/*.json'))
+          print(f"### CLI 出站抓包：{len(files)} 条")
+          for f in files:
+              try:
+                  r = json.load(open(f, encoding='utf-8'))
+              except Exception as e:
+                  print(f"- `{os.path.basename(f)}` 解析失败 {e}")
+                  continue
+              try:
+                  body = json.loads(r['body'])
+              except Exception:
+                  body = {}
+              tools = body.get('tools') or []
+              names = [((t.get('function') or {}).get('name') or t.get('name') or '?') for t in tools]
+              print(f"- `{os.path.basename(f)}` {r['body_len']}B tools={len(tools)} path={r['path']}")
+              if tools:
+                  print(f"  - names: {', '.join(names[:16])}{' ...' if len(names) > 16 else ''}")
+          try:
+              print(f"- upstream exact-cli-body: `{open('cap/up_cli.txt').read()[:200]}`")
+          except Exception:
+              pass
+          PY
