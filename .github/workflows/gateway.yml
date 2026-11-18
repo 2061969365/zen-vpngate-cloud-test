@@ -1,8 +1,8 @@
-name: zen-gateway-warp
+name: zen-gateway-vpngate
 
-# Cloudflare WARP 节点模板：
-#   利用 Cloudflare WARP 双栈 TUN 虚拟网卡为网关提供 Anycast 出口，彻底规避机房 IP 拒连。
-#   3 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
+# VPNGate / OpenVPN 特例节点模板：
+#   基于 sing-box openvpn-client 接入 VPNGate 节点池，为网关提供住宅/商业宽带出口。
+#   3 小时软交班 + 硬超时兜底 + 故障转移。
 #   网关直接复用预编译二进制（bin/zen-direct）。
 
 on:
@@ -17,11 +17,11 @@ on:
 
 permissions:
   contents: read
-  actions: write # 需要它来 dispatch 下一次运行
+  actions: write
 
 concurrency:
   group: zen-gateway
-  cancel-in-progress: false # 让新 run 排队，等旧 run 自己退场
+  cancel-in-progress: false
 
 env:
   PORT: "8081"
@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 210
 
     steps:
-      - name: Checkout (预编译二进制在这里)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prune old runs (keep 3)
@@ -45,24 +45,18 @@ jobs:
           set -uo pipefail
           repo="${{ github.repository }}"
           keep=3
-          echo "只保留最近 $keep 条已完成的 run，更早的删除"
           gh api "repos/$repo/actions/workflows/gateway.yml/runs?per_page=100" \
             --jq '[.workflow_runs[] | select(.status == "completed")] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
           | while read -r id; do
               [ -n "$id" ] || continue
               [ "$id" = "${{ github.run_id }}" ] && continue
-              if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
-                echo "deleted run $id"
-              else
-                echo "skip run $id (delete failed)"
-              fi
+              gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1 || true
             done
 
       - name: Check binary
         run: |
           set -euo pipefail
           chmod +x bin/zen-direct
-          ls -l bin/zen-direct
           sha256sum bin/zen-direct
           rc=0
           ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
@@ -71,150 +65,55 @@ jobs:
             exit 1
           fi
 
-      - name: Cache cloudflare-warp package
-        id: cache-warp-deb
-        uses: actions/cache@v4
-        with:
-          path: .cache/cloudflare-warp.deb
-          key: cloudflare-warp-deb-2026.8.2115.0
-
-      - name: Fix DNS & Network Tuning (BBR + 双栈 DNS)
+      - name: Fix DNS before any download
         run: |
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo systemctl disable systemd-resolved 2>/dev/null || true
-          sudo rm -f /etc/resolv.conf
-          sudo tee /etc/resolv.conf >/dev/null <<'EOF'
-          nameserver 1.1.1.1
-          nameserver 2606:4700:4700::1111
-          nameserver 8.8.8.8
-          nameserver 1.0.0.1
-          EOF
-          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
-
-      - name: Setup WARP (只提取 CLI/SVC，跳过 GUI 依赖)
-        run: |
-          set -euo pipefail
-          mkdir -p .cache
-          deb=.cache/cloudflare-warp.deb
-          if [ ! -s "$deb" ] || ! dpkg-deb --info "$deb" >/dev/null 2>&1; then
-            echo "下载 cloudflare-warp 官方包..."
-            curl -fsSL --retry 3 --retry-delay 1 \
-              -o "$deb" \
-              https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
-          fi
-
-          # warp-svc 只需要这些运行库，不装 webkit/gtk GUI 依赖。
-          # 必需库：缺了 warp-svc 起不来。
-          deps=(
-            libdbus-1-3 libnss3 libpcap0.8
-            iproute2 nftables libcap2-bin ca-certificates
-          )
-          # 可选库：TPM 相关（TPM 透传/证明用）。取不到不影响 TUN 出口，
-          # 但 apt 拉包时 DNS 抖动会把整步带崩，所以单独装、失败只告警。
-          optional_deps=(libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64)
-
-          # Azure runner 的默认 DNS 偶尔解析失败，apt 会整体失败；
-          # 这里强制用公共 DNS + 重试，别让一次抖动废掉整个 run。
-          resolve_ok=0
           for ns in 1.1.1.1 8.8.8.8 9.9.9.9; do
             sudo rm -f /etc/resolv.conf
             printf 'nameserver %s\nnameserver 2606:4700:4700::1111\n' "$ns" | sudo tee /etc/resolv.conf >/dev/null
-            if getent hosts archive.ubuntu.com >/dev/null 2>&1; then resolve_ok=1; break; fi
+            if getent hosts github.com >/dev/null 2>&1; then break; fi
           done
-          if [ "$resolve_ok" != "1" ]; then
-            echo "::warning::公共 DNS 全部不可用，继续用系统 DNS 尝试"
-          fi
+          getent hosts github.com >/dev/null 2>&1 || echo "::warning::公共 DNS 都没通，下载可能失败"
 
-          apt_try() {
-            local n=0
-            while [ "$n" -lt 3 ]; do
-              if sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 \
-                   -o Acquire::https::Timeout=20 install -y --no-install-recommends "$@"; then
-                return 0
-              fi
-              n=$((n + 1))
-              echo "apt 安装失败（第 $n 次），刷新索引后重试..."
-              sudo apt-get -o Acquire::Retries=5 update -y || true
-            done
-            return 1
-          }
-
-          if ! apt_try "${deps[@]}"; then
-            echo "::error::warp-svc 必需依赖装不上，放弃本次 run"
-            exit 1
-          fi
-          if ! apt_try "${optional_deps[@]}"; then
-            echo "::warning::TPM 相关可选依赖没装上，不影响 WARP TUN，继续"
-          fi
-
-          rm -rf /tmp/warp-extract
-          mkdir -p /tmp/warp-extract
-          dpkg-deb --fsys-tarfile "$deb" \
-            | tar -x -C /tmp/warp-extract \
-                ./bin/warp-svc ./bin/warp-cli ./lib/systemd/system/warp-svc.service
-
-          sudo install -m 0755 /tmp/warp-extract/bin/warp-svc /usr/bin/warp-svc
-          sudo install -m 0755 /tmp/warp-extract/bin/warp-cli /usr/bin/warp-cli
-          sudo install -m 0644 /tmp/warp-extract/lib/systemd/system/warp-svc.service \
-            /etc/systemd/system/warp-svc.service
-          sudo systemctl daemon-reload
-          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
-          sudo systemctl restart warp-svc
-
-          # 等 daemon socket 真正可用；systemctl is-active 不够，socket 可能还没建好。
-          ready=0
-          for i in $(seq 1 60); do
-            if timeout 2 sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
-            sleep 0.25
-          done
-          if [ "$ready" != "1" ]; then
-            echo "::error::cloudflare-warp daemon 未就绪"
-            sudo systemctl status warp-svc --no-pager || true
-            sudo journalctl -u warp-svc -n 80 --no-pager || true
-            exit 1
-          fi
-
-          retry() {
-            local n=0
-            until "$@"; do
-              n=$((n + 1))
-              if [ "$n" -ge 4 ]; then return 1; fi
-              sleep 1
-            done
-          }
-          retry timeout 30 sudo warp-cli --accept-tos registration new
-          retry timeout 30 sudo warp-cli --accept-tos mode warp+doh
-          retry timeout 30 sudo warp-cli --accept-tos connect
-
-          # connect 是异步的，必须等到真正 Connected 再做 DNS/网关。
-          connected=0
-          for i in $(seq 1 60); do
-            st="$(timeout 2 sudo warp-cli --accept-tos status 2>&1 || true)"
-            if printf '%s' "$st" | grep -qE 'Status update: Connected|warp=on'; then
-              connected=1
-              break
-            fi
-            sleep 0.5
-          done
-          if [ "$connected" != "1" ]; then
-            echo "::error::WARP 未在限定时间内连接"
-            timeout 10 sudo warp-cli --accept-tos status || true
-            sudo journalctl -u warp-svc -n 80 --no-pager || true
-            exit 1
-          fi
-          echo "WARP 已连接（提取模式，跳过 GUI 依赖）"
-
-      - name: Cache cloudflared binary
-        id: cache-cloudflared
+      - name: Cache sing-box binary
+        id: cache-singbox
         uses: actions/cache@v4
         with:
-          path: bin/cloudflared
-          key: cloudflared-linux-amd64-v1
+          path: /usr/local/bin/sing-box
+          key: sing-box-1.14.4-linux-amd64
+
+      - name: Install sing-box
+        if: steps.cache-singbox.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          V="1.14.4"
+          echo "安装 sing-box $V"
+          curl -sL -m 60 -o /tmp/sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v${V}/sing-box-${V}-linux-amd64.tar.gz"
+          tar xzf /tmp/sb.tgz -C /tmp
+          sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version | head -1
+
+      - name: Setup sing-box & VPNGate (50 握手探活 + 20 并发 zen-direct 真实对话探 200 + 早停)
+        run: |
+          set -euo pipefail
+          echo "拉取 VPNGate 节点 (开启 gzip 极速传输)..."
+          curl -s --compressed -m 20 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 35 --keep-nodes 3 --mixed-port 18080 || true
+
+          if [ -s /tmp/sb.json ]; then
+            sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/18080) 2>/dev/null; then exec 3>&-; break; fi
+              sleep 0.1
+            done
+            echo "sing-box 启动完成，监听 127.0.0.1:18080"
+            touch /tmp/vpngate_ready
+          else
+            echo "未筛选出可用节点，使用原生网络兜底"
+          fi
 
       - name: Install cloudflared
-        if: steps.cache-cloudflared.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 --retry-delay 2 \
@@ -238,12 +137,12 @@ jobs:
         run: |
           reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
           {
-            echo "### zen-gateway-warp"
+            echo "### zen-gateway-vpngate"
             echo ""
-            echo "- 模板类型：\`Cloudflare WARP (Dual-Stack TUN)\`"
+            echo "- 模板类型：\`VPNGate + sing-box OpenVPN\`"
             echo "- 交班原因：\`$reason\`"
             echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
-            echo "- 出口 IPv4：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
+            echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
             echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
             echo "- 隧道观测：$(cat run/tunnel-stats.txt 2>/dev/null || echo '?')"
@@ -268,6 +167,3 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
             -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\"}" || echo 000)"
           echo "dispatch next run -> HTTP $code"
-          if [ "$code" != "204" ]; then
-            echo "::warning::下一次运行没派出去（HTTP $code），靠 cron 补位"
-          fi
