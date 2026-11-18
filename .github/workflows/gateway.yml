@@ -128,7 +128,6 @@ jobs:
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
           MAX_RUN_SEC: ${{ inputs.max_run_sec || '10800' }}
           PROXY_URL: ${{ vars.PROXY_URL }}
-          ZEN_LEGACY_WIRE: ${{ vars.ZEN_LEGACY_WIRE }}
         run: bash scripts/run-gateway.sh
 
       - name: Handoff and summary
